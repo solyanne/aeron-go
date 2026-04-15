@@ -842,7 +842,7 @@ func (cc *ClientConductor) OnNewPublication(streamID int32, sessionID int32, pos
 			pubDef.channelStatusIndicatorID = channelStatusIndicatorID
 			pubDef.buffers = logbuffer.Wrap(logFileName)
 			if pubDef.buffers == nil {
-				logger.Warnf("OnNewPublication: stale log file %s, keeping AwaitingMediaDriver so caller can timeout and retry", logFileName)
+				logger.Infof("OnNewPublication: stale log file %s, keeping AwaitingMediaDriver so caller can timeout and retry", logFileName)
 				// Do NOT set ErroredMediaDriver — that's terminal and poisons the client.
 				// Keep AwaitingMediaDriver so the caller times out and can retry AddPublication.
 				// The driver may send a fresh OnNewPublication later with a valid file.
@@ -878,7 +878,7 @@ func (cc *ClientConductor) OnNewExclusivePublication(streamID int32, sessionID i
 			pubDef.channelStatusIndicatorID = channelStatusIndicatorID
 			pubDef.buffers = logbuffer.Wrap(logFileName)
 			if pubDef.buffers == nil {
-				logger.Warnf("OnNewExclusivePublication: stale log file %s, keeping AwaitingMediaDriver so caller can timeout and retry", logFileName)
+				logger.Infof("OnNewExclusivePublication: stale log file %s, keeping AwaitingMediaDriver so caller can timeout and retry", logFileName)
 				continue
 			}
 			pubDef.buffers.IncRef()
@@ -962,7 +962,7 @@ func DefaultImageFactory(sessionID int32, corrID int64, logFilename string, subR
 	counterValuesBuffer *atomic.Buffer, subscriberPositionID int32) Image {
 	logBuffers := logbuffer.Wrap(logFilename)
 	if logBuffers == nil {
-		logger.Warnf("DefaultImageFactory: stale log file %s, skipping image", logFilename)
+		logger.Infof("DefaultImageFactory: stale log file %s, skipping image", logFilename)
 		return nil
 	}
 	image := NewImage(sessionID, corrID, logBuffers)
@@ -993,7 +993,7 @@ func (cc *ClientConductor) OnAvailableImage(streamID int32, sessionID int32, log
 					cc.counterValuesBuffer, subscriberPositionID)
 
 				if image == nil {
-					logger.Warnf("OnAvailableImage: skipping nil image for stream %d (stale log file)", streamID)
+					logger.Infof("OnAvailableImage: skipping nil image for stream %d (stale log file)", streamID)
 					continue
 				}
 
