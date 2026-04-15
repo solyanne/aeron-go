@@ -43,7 +43,7 @@ var memories = sync.Map{}
 func GetFileSize(filename string) int64 {
 	fi, err := os.Stat(filename)
 	if err != nil {
-		logger.Error(err)
+		logger.Debugf("stat %s: %v", filename, err)
 		return -1
 	}
 

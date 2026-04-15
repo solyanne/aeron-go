@@ -41,12 +41,12 @@ func Wrap(fileName string) *LogBuffers {
 
 	logLength := memmap.GetFileSize(fileName)
 	if logLength <= 0 {
-		logger.Errorf("logbuffer file missing or empty: %s (size=%d)", fileName, logLength)
+		logger.Debugf("logbuffer file missing or empty: %s (size=%d)", fileName, logLength)
 		return nil
 	}
 	termLength := computeTermLength(int32(logLength))
 	if termLength < TermMinLength {
-		logger.Errorf("logbuffer file has invalid term length: %s (termLength=%d, logLength=%d)", fileName, termLength, logLength)
+		logger.Debugf("logbuffer file has invalid term length: %s (termLength=%d, logLength=%d)", fileName, termLength, logLength)
 		return nil
 	}
 
