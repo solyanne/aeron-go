@@ -836,18 +836,19 @@ func (cc *ClientConductor) OnNewPublication(streamID int32, sessionID int32, pos
 
 	for _, pubDef := range cc.pubs {
 		if pubDef.regID == regID {
+			buffers := logbuffer.Wrap(logFileName)
+			if buffers == nil {
+				logger.Infof("OnNewPublication: stale log file %s, setting ErroredMediaDriver with message so caller can retry", logFileName)
+				pubDef.status = RegistrationStatus.ErroredMediaDriver
+				pubDef.errorCode = 0
+				pubDef.errorMessage = "stale logbuffer: " + logFileName
+				continue
+			}
 			pubDef.status = RegistrationStatus.RegisteredMediaDriver
 			pubDef.sessionID = sessionID
 			pubDef.posLimitCounterID = posLimitCounterID
 			pubDef.channelStatusIndicatorID = channelStatusIndicatorID
-			pubDef.buffers = logbuffer.Wrap(logFileName)
-			if pubDef.buffers == nil {
-				logger.Infof("OnNewPublication: stale log file %s, keeping AwaitingMediaDriver so caller can timeout and retry", logFileName)
-				// Do NOT set ErroredMediaDriver — that's terminal and poisons the client.
-				// Keep AwaitingMediaDriver so the caller times out and can retry AddPublication.
-				// The driver may send a fresh OnNewPublication later with a valid file.
-				continue
-			}
+			pubDef.buffers = buffers
 			pubDef.buffers.IncRef()
 			pubDef.origRegID = origRegID
 
@@ -872,15 +873,19 @@ func (cc *ClientConductor) OnNewExclusivePublication(streamID int32, sessionID i
 
 	for _, pubDef := range cc.pubs {
 		if pubDef.regID == regID {
+			buffers := logbuffer.Wrap(logFileName)
+			if buffers == nil {
+				logger.Infof("OnNewExclusivePublication: stale log file %s, setting ErroredMediaDriver with message so caller can retry", logFileName)
+				pubDef.status = RegistrationStatus.ErroredMediaDriver
+				pubDef.errorCode = 0
+				pubDef.errorMessage = "stale logbuffer: " + logFileName
+				continue
+			}
 			pubDef.status = RegistrationStatus.RegisteredMediaDriver
 			pubDef.sessionID = sessionID
 			pubDef.posLimitCounterID = posLimitCounterID
 			pubDef.channelStatusIndicatorID = channelStatusIndicatorID
-			pubDef.buffers = logbuffer.Wrap(logFileName)
-			if pubDef.buffers == nil {
-				logger.Infof("OnNewExclusivePublication: stale log file %s, keeping AwaitingMediaDriver so caller can timeout and retry", logFileName)
-				continue
-			}
+			pubDef.buffers = buffers
 			pubDef.buffers.IncRef()
 			pubDef.origRegID = origRegID
 
