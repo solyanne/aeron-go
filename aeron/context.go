@@ -42,6 +42,31 @@ type Context struct {
 	publicationConnectionTo time.Duration
 	interServiceTo          time.Duration
 
+	// keepaliveInterval controls how often the client pings the driver with a
+	// heartbeat counter update. Default 500ms. Lower values make liveness
+	// detection faster; higher values reduce CPU usage during quiet periods.
+	keepaliveInterval time.Duration
+
+	// startupGracePeriod extends mediaDriverTo and interServiceTo for this
+	// duration after client connection. Useful for clients that do a long
+	// initialization (e.g. Kafka bootstrap) right after connecting — without
+	// this grace, the driver may timeout the client before it starts pinging.
+	// Default 0 (disabled).
+	startupGracePeriod time.Duration
+
+	// startupGraceMultiplier is the factor applied to timeouts during the
+	// grace period. Default 4x.
+	startupGraceMultiplier int
+
+	// publicationRetryCount is the number of times AddPublication retries
+	// internally on ErroredMediaDriver (e.g. stale logbuffer) before returning
+	// the error to the caller. Default 3.
+	publicationRetryCount int
+
+	// publicationRetryDelay is the delay between internal AddPublication
+	// retries. Default 200ms.
+	publicationRetryDelay time.Duration
+
 	idleStrategy idlestrategy.Idler
 }
 
@@ -62,6 +87,12 @@ func NewContext() *Context {
 	ctx.resourceLingerTo = time.Second * 3
 	ctx.publicationConnectionTo = time.Second * 5
 	ctx.interServiceTo = time.Second * 10
+
+	ctx.keepaliveInterval = time.Millisecond * 500
+	ctx.startupGracePeriod = 0
+	ctx.startupGraceMultiplier = 4
+	ctx.publicationRetryCount = 3
+	ctx.publicationRetryDelay = time.Millisecond * 200
 
 	ctx.idleStrategy = idlestrategy.Sleeping{SleepFor: time.Millisecond * 4}
 
@@ -100,6 +131,53 @@ func (ctx *Context) InterServiceTimeout(to time.Duration) *Context {
 
 func (ctx *Context) PublicationConnectionTimeout(to time.Duration) *Context {
 	ctx.publicationConnectionTo = to
+	return ctx
+}
+
+// KeepaliveInterval sets the frequency at which the client updates its
+// heartbeat counter read by the driver. Default 500ms.
+func (ctx *Context) KeepaliveInterval(interval time.Duration) *Context {
+	if interval > 0 {
+		ctx.keepaliveInterval = interval
+	}
+	return ctx
+}
+
+// StartupGracePeriod extends driver and inter-service timeouts by
+// startupGraceMultiplier for this duration after Connect(). Useful for clients
+// that perform long initialization before using Aeron publications. Default 0
+// (disabled). Recommended 60s-600s for clients with heavy bootstrap.
+func (ctx *Context) StartupGracePeriod(duration time.Duration) *Context {
+	ctx.startupGracePeriod = duration
+	return ctx
+}
+
+// StartupGraceMultiplier sets the factor applied to timeouts during the grace
+// period. Default 4. Must be at least 1.
+func (ctx *Context) StartupGraceMultiplier(multiplier int) *Context {
+	if multiplier < 1 {
+		multiplier = 1
+	}
+	ctx.startupGraceMultiplier = multiplier
+	return ctx
+}
+
+// PublicationRetryCount sets the number of times AddPublication retries
+// internally on stale logbuffer / ErroredMediaDriver before returning the error.
+// Default 3.
+func (ctx *Context) PublicationRetryCount(count int) *Context {
+	if count >= 0 {
+		ctx.publicationRetryCount = count
+	}
+	return ctx
+}
+
+// PublicationRetryDelay sets the delay between internal AddPublication retries.
+// Default 200ms.
+func (ctx *Context) PublicationRetryDelay(delay time.Duration) *Context {
+	if delay >= 0 {
+		ctx.publicationRetryDelay = delay
+	}
 	return ctx
 }
 

@@ -46,8 +46,8 @@ var RegistrationStatus = struct {
 }
 
 const (
-	keepaliveTimeoutNS = 500 * int64(time.Millisecond)
-	resourceTimeoutNS  = 1000 * int64(time.Millisecond)
+	defaultKeepaliveTimeoutNS = 500 * int64(time.Millisecond)
+	resourceTimeoutNS         = 1000 * int64(time.Millisecond)
 
 	// heartbeatTypeId is the type id of a heartbeat counter.
 	heartbeatTypeId = int32(11)
@@ -223,6 +223,22 @@ type ClientConductor struct {
 	publicationConnectionTimeoutNs  int64
 	resourceLingerTimeoutNs         int64
 
+	// keepaliveIntervalNs is the frequency at which the client updates its
+	// heartbeat counter. Configurable via Context.
+	keepaliveIntervalNs int64
+
+	// startupGracePeriodEndNs is the absolute wall-clock (UnixNano) at which
+	// the startup grace period ends. During this period, driverTimeoutNs and
+	// interServiceTimeoutNs are multiplied by startupGraceMultiplier.
+	// Zero means grace period disabled or already expired.
+	startupGracePeriodEndNs int64
+	startupGraceMultiplier  int64
+
+	// publicationRetryCount is the number of internal retries in AddPublication
+	// when the driver returns ErroredMediaDriver (e.g. stale logbuffer).
+	publicationRetryCount int
+	publicationRetryDelay time.Duration
+
 	heartbeatTimestamp *ctr.AtomicCounter
 }
 
@@ -242,6 +258,13 @@ func (cc *ClientConductor) Init(driverProxy DriverProxy, bcast *broadcast.CopyRe
 	cc.publicationConnectionTimeoutNs = pubConnectionTo.Nanoseconds()
 	cc.resourceLingerTimeoutNs = lingerTo.Nanoseconds()
 
+	// Defaults for liveness tuning; overridden by ConfigureLiveness() if Context has it.
+	cc.keepaliveIntervalNs = defaultKeepaliveTimeoutNS
+	cc.startupGracePeriodEndNs = 0
+	cc.startupGraceMultiplier = 4
+	cc.publicationRetryCount = 3
+	cc.publicationRetryDelay = 200 * time.Millisecond
+
 	cc.counterValuesBuffer = counters.ValuesBuf.Get()
 	cc.counterReader = ctr.NewReader(counters.ValuesBuf.Get(), counters.MetaDataBuf.Get())
 
@@ -255,6 +278,70 @@ func (cc *ClientConductor) Init(driverProxy DriverProxy, bcast *broadcast.CopyRe
 	cc.availableCounterHandlers = make([]*IdAndAvailableCounterHandler, 0)
 	cc.unavailableCounterHandlers = make([]*IdAndUnavailableCounterHandler, 0)
 	return cc
+}
+
+// ConfigureLiveness applies liveness tuning from a Context onto the conductor.
+// Call this after Init() if you want to use custom keepalive/grace-period/retry
+// values set via Context setters.
+func (cc *ClientConductor) ConfigureLiveness(ctx *Context) *ClientConductor {
+	if ctx == nil {
+		return cc
+	}
+	if ctx.keepaliveInterval > 0 {
+		cc.keepaliveIntervalNs = ctx.keepaliveInterval.Nanoseconds()
+	}
+	if ctx.startupGracePeriod > 0 {
+		cc.startupGracePeriodEndNs = time.Now().UnixNano() + ctx.startupGracePeriod.Nanoseconds()
+	}
+	if ctx.startupGraceMultiplier >= 1 {
+		cc.startupGraceMultiplier = int64(ctx.startupGraceMultiplier)
+	}
+	if ctx.publicationRetryCount >= 0 {
+		cc.publicationRetryCount = ctx.publicationRetryCount
+	}
+	if ctx.publicationRetryDelay >= 0 {
+		cc.publicationRetryDelay = ctx.publicationRetryDelay
+	}
+	if cc.startupGracePeriodEndNs > 0 {
+		logger.Infof("ClientConductor: startup grace period active for %v, timeouts multiplied by %dx",
+			ctx.startupGracePeriod, cc.startupGraceMultiplier)
+	}
+	return cc
+}
+
+// IsDriverAlive returns true if the media driver is currently alive and
+// responsive. It checks both the internal driverActive flag (set false by the
+// heartbeat loop when the driver stops responding) and the age of the driver's
+// last keepalive. During the startup grace period, the tolerance is
+// multiplied by startupGraceMultiplier.
+func (cc *ClientConductor) IsDriverAlive() bool {
+	if !cc.driverActive.Get() {
+		return false
+	}
+	now := time.Now().UnixNano()
+	lastKeepaliveMs := cc.driverProxy.TimeOfLastDriverKeepalive()
+	lastKeepaliveNs := lastKeepaliveMs * time.Millisecond.Nanoseconds()
+	age := now - lastKeepaliveNs
+	timeoutNs := cc.effectiveDriverTimeoutNs(now)
+	return age <= timeoutNs
+}
+
+// effectiveDriverTimeoutNs returns the driver timeout, applying the startup
+// grace multiplier when still within the grace period.
+func (cc *ClientConductor) effectiveDriverTimeoutNs(now int64) int64 {
+	if cc.startupGracePeriodEndNs > 0 && now < cc.startupGracePeriodEndNs {
+		return cc.driverTimeoutNs * cc.startupGraceMultiplier
+	}
+	return cc.driverTimeoutNs
+}
+
+// effectiveInterServiceTimeoutNs returns the inter-service timeout with the
+// grace multiplier applied during the startup grace period.
+func (cc *ClientConductor) effectiveInterServiceTimeoutNs(now int64) int64 {
+	if cc.startupGracePeriodEndNs > 0 && now < cc.startupGracePeriodEndNs {
+		return cc.interServiceTimeoutNs * cc.startupGraceMultiplier
+	}
+	return cc.interServiceTimeoutNs
 }
 
 // Close will terminate the Run() goroutine body and close all active publications and subscription. Run() can
@@ -1050,13 +1137,13 @@ func (cc *ClientConductor) OnChannelEndpointError(corrID int64, errorMessage str
 
 	for _, pubDef := range cc.pubs {
 		if pubDef.publication != nil && pubDef.publication.ChannelStatusID() == statusIndicatorId {
-			cc.onError(fmt.Errorf(errorMessage))
+			cc.onError(errors.New(errorMessage))
 		}
 	}
 
 	for _, subDef := range cc.subs {
 		if subDef.subscription != nil && subDef.subscription.ChannelStatusId() == statusIndicatorId {
-			cc.onError(fmt.Errorf(errorMessage))
+			cc.onError(errors.New(errorMessage))
 		}
 	}
 }
@@ -1097,26 +1184,32 @@ func (cc *ClientConductor) onHeartbeatCheckTimeouts() (int, error) {
 
 	now := time.Now().UnixNano()
 
-	if now > (cc.timeOfLastDoWork + cc.interServiceTimeoutNs) {
+	interServiceTimeoutNs := cc.effectiveInterServiceTimeoutNs(now)
+	if now > (cc.timeOfLastDoWork + interServiceTimeoutNs) {
 		cc.closeAllResources(now)
 
 		return 0, fmt.Errorf("timeout between service calls over %d ms (%d > %d + %d) (%d)",
-			cc.interServiceTimeoutNs/time.Millisecond.Nanoseconds(),
+			interServiceTimeoutNs/time.Millisecond.Nanoseconds(),
 			now/time.Millisecond.Nanoseconds(),
 			cc.timeOfLastDoWork,
-			cc.interServiceTimeoutNs/time.Millisecond.Nanoseconds(),
+			interServiceTimeoutNs/time.Millisecond.Nanoseconds(),
 			(now-cc.timeOfLastDoWork)/time.Millisecond.Nanoseconds())
 	}
 
 	cc.timeOfLastDoWork = now
 
-	if now > (cc.timeOfLastKeepalive + keepaliveTimeoutNS) {
-		age := cc.driverProxy.TimeOfLastDriverKeepalive()*time.Millisecond.Nanoseconds() + cc.driverTimeoutNs
+	keepaliveIntervalNs := cc.keepaliveIntervalNs
+	if keepaliveIntervalNs <= 0 {
+		keepaliveIntervalNs = defaultKeepaliveTimeoutNS
+	}
+	if now > (cc.timeOfLastKeepalive + keepaliveIntervalNs) {
+		driverTimeoutNs := cc.effectiveDriverTimeoutNs(now)
+		age := cc.driverProxy.TimeOfLastDriverKeepalive()*time.Millisecond.Nanoseconds() + driverTimeoutNs
 		if now > age {
 			cc.driverActive.Set(false)
 			return 0, fmt.Errorf("MediaDriver keepalive (ms): age=%d > timeout=%d",
 				age,
-				cc.driverTimeoutNs/time.Millisecond.Nanoseconds(),
+				driverTimeoutNs/time.Millisecond.Nanoseconds(),
 			)
 		}
 
@@ -1125,10 +1218,22 @@ func (cc *ClientConductor) onHeartbeatCheckTimeouts() (int, error) {
 			if ctrErr == nil && registrationID == cc.driverProxy.ClientID() {
 				cc.heartbeatTimestamp.Set(now / time.Millisecond.Nanoseconds())
 			} else {
-				cc.closeAllResources(now)
-				return 0, fmt.Errorf("client heartbeat timestamp not active")
+				// Counter became invalid (driver may have reset client state).
+				// Instead of closing everything, drop the stale counter ref and
+				// let the re-acquisition path below find a fresh one on the next
+				// tick. During the startup grace period we never fatally error.
+				logger.Infof("heartbeat counter invalid (regID=%d, clientID=%d, err=%v), re-acquiring",
+					registrationID, cc.driverProxy.ClientID(), ctrErr)
+				cc.heartbeatTimestamp = nil
+				if cc.startupGracePeriodEndNs > 0 && now < cc.startupGracePeriodEndNs {
+					// In grace period — don't panic, just skip this tick.
+					cc.timeOfLastKeepalive = now
+					return result, nil
+				}
+				// Out of grace period: fall through to the re-acquisition block.
 			}
-		} else {
+		}
+		if cc.heartbeatTimestamp == nil {
 			counterId := cc.counterReader.FindCounter(heartbeatTypeId, func(keyBuffer *atomic.Buffer) bool {
 				return keyBuffer.GetInt64(heartheatRegistrationIdOffset) == cc.driverProxy.ClientID()
 			})

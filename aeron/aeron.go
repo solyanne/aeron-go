@@ -16,9 +16,11 @@
 package aeron
 
 import (
-	"github.com/lirm/aeron-go/aeron/atomic"
+	"errors"
+	"strings"
 	"time"
 
+	"github.com/lirm/aeron-go/aeron/atomic"
 	"github.com/lirm/aeron-go/aeron/broadcast"
 	"github.com/lirm/aeron-go/aeron/counters"
 	"github.com/lirm/aeron-go/aeron/driver"
@@ -100,6 +102,7 @@ func Connect(ctx *Context) (*Aeron, error) {
 
 	aeron.conductor.Init(&aeron.driverProxy, aeron.toClientsCopyReceiver, clientLivenessTo, ctx.mediaDriverTo,
 		ctx.publicationConnectionTo, ctx.resourceLingerTo, aeron.counters)
+	aeron.conductor.ConfigureLiveness(ctx)
 
 	aeron.conductor.onAvailableImageHandler = ctx.availableImageHandler
 	aeron.conductor.onUnavailableImageHandler = ctx.unavailableImageHandler
@@ -239,18 +242,86 @@ func (aeron *Aeron) AddPublicationDeprecated(channel string, streamID int32) cha
 
 // AddPublication will add a new publication to the driver. If such publication already exists within ClientConductor
 // the same instance will be returned.
+//
+// On ErroredMediaDriver (e.g. stale logbuffer file from a previous crashed
+// process), retries up to publicationRetryCount times with publicationRetryDelay
+// between attempts. Configure via Context.PublicationRetryCount / RetryDelay.
 func (aeron *Aeron) AddPublication(channel string, streamID int32) (*Publication, error) {
-	registrationID, err := aeron.conductor.AddPublication(channel, streamID)
-	if err != nil {
-		return nil, err
-	}
-	for {
-		publication, err := aeron.conductor.FindPublication(registrationID)
-		if publication != nil || err != nil {
-			return publication, err
+	return aeron.addPublicationWithRetry(channel, streamID, false)
+}
+
+// AddExclusivePublication will add a new exclusive publication to the driver. If such publication already
+// exists within ClientConductor the same instance will be returned.
+func (aeron *Aeron) AddExclusivePublication(channel string, streamID int32) (*Publication, error) {
+	return aeron.addPublicationWithRetry(channel, streamID, true)
+}
+
+// addPublicationWithRetry wraps AddPublication/AddExclusivePublication with
+// an internal retry on ErroredMediaDriver. The retry tolerates transient stale
+// logbuffer errors that the fork already returns via ErroredMediaDriver status
+// (see OnNewPublication patches). It does NOT retry on other errors (channel
+// parse errors, driver-level rejections for good reason, etc.).
+func (aeron *Aeron) addPublicationWithRetry(channel string, streamID int32, exclusive bool) (*Publication, error) {
+	retries := aeron.conductor.publicationRetryCount
+	delay := aeron.conductor.publicationRetryDelay
+	var lastErr error
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 && delay > 0 {
+			time.Sleep(delay)
 		}
-		aeron.context.idleStrategy.Idle(0)
+		var registrationID int64
+		var err error
+		if exclusive {
+			registrationID, err = aeron.conductor.AddExclusivePublication(channel, streamID)
+		} else {
+			registrationID, err = aeron.conductor.AddPublication(channel, streamID)
+		}
+		if err != nil {
+			lastErr = err
+			// Hard failure on submit — don't retry.
+			return nil, err
+		}
+		for {
+			publication, err := aeron.conductor.FindPublication(registrationID)
+			if publication != nil {
+				return publication, nil
+			}
+			if err != nil {
+				lastErr = err
+				// Check if this is an ErroredMediaDriver (retryable). Error
+				// format: "error on REGID: CODE: MESSAGE". Retryable when the
+				// message mentions stale logbuffer (our fork's patch).
+				if isRetryableMediaDriverError(err) && attempt < retries {
+					logger.Infof("AddPublication retryable error (attempt %d/%d): %v",
+						attempt+1, retries+1, err)
+					// Clean up the failed pub state before retry so the next
+					// AddPublication gets a fresh regID and slot.
+					_ = aeron.conductor.releasePublication(registrationID)
+					break
+				}
+				return nil, err
+			}
+			aeron.context.idleStrategy.Idle(0)
+		}
 	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("AddPublication exhausted retries without result")
+}
+
+// isRetryableMediaDriverError reports whether an error returned by
+// FindPublication represents a transient ErroredMediaDriver state that should
+// be retried (e.g. stale logbuffer after a driver reset). Non-retryable errors
+// include timeouts and channel configuration errors.
+func isRetryableMediaDriverError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Our fork sets errorMessage="stale logbuffer: <file>" on OnNewPublication
+	// when the logbuffer Wrap fails. Match on that substring.
+	return strings.Contains(msg, "stale logbuffer")
 }
 
 // AsyncAddPublication will add a new publication to the driver and return its registration ID.  That ID can be used to
@@ -265,20 +336,17 @@ func (aeron *Aeron) GetPublication(registrationID int64) (*Publication, error) {
 	return aeron.conductor.FindPublication(registrationID)
 }
 
-// AddExclusivePublication will add a new exclusive publication to the driver. If such publication already
-// exists within ClientConductor the same instance will be returned.
-func (aeron *Aeron) AddExclusivePublication(channel string, streamID int32) (*Publication, error) {
-	registrationID, err := aeron.conductor.AddExclusivePublication(channel, streamID)
-	if err != nil {
-		return nil, err
+// IsDriverAlive returns true if the media driver is currently alive and
+// responding. Delegates to ClientConductor.IsDriverAlive().
+//
+// Wrapper code can use this to decide whether to clean up stale driver files
+// (safe when driver is dead) vs. retry (when driver is alive but publications
+// are transiently stale).
+func (aeron *Aeron) IsDriverAlive() bool {
+	if aeron == nil {
+		return false
 	}
-	for {
-		publication, err := aeron.conductor.FindPublication(registrationID)
-		if publication != nil || err != nil {
-			return publication, err
-		}
-		aeron.context.idleStrategy.Idle(0)
-	}
+	return aeron.conductor.IsDriverAlive()
 }
 
 // AddExclusivePublicationDeprecated will add a new exclusive publication to the driver. If such publication already
