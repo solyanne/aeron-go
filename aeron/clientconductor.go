@@ -915,6 +915,31 @@ func (cc *ClientConductor) RemoveUnavailableCounterHandler(handler UnavailableCo
 func (cc *ClientConductor) OnNewPublication(streamID int32, sessionID int32, posLimitCounterID int32,
 	channelStatusIndicatorID int32, logFileName string, regID int64, origRegID int64) {
 
+	// Defensive recover: any panic here (typically nil-deref on corrupted
+	// pubDef, or logbuffer mmap failure) must not crash the conductor
+	// goroutine. Mark the matching pubDef as ErroredMediaDriver so the
+	// caller sees an error and can retry.
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Infof("OnNewPublication: recovered from panic (regID=%d, logFile=%s): %v", regID, logFileName, r)
+			// adminLock may or may not be held when panic occurs; TryLock to avoid deadlock.
+			locked := cc.adminLock.TryLock()
+			for _, pubDef := range cc.pubs {
+				if pubDef == nil {
+					continue
+				}
+				if pubDef.regID == regID {
+					pubDef.status = RegistrationStatus.ErroredMediaDriver
+					pubDef.errorCode = 0
+					pubDef.errorMessage = fmt.Sprintf("OnNewPublication panic: %v", r)
+				}
+			}
+			if locked {
+				cc.adminLock.Unlock()
+			}
+		}
+	}()
+
 	logger.Debugf("OnNewPublication: streamId=%d, sessionId=%d, posLimitCounterID=%d, channelStatusIndicatorID=%d, logFileName=%s, correlationID=%d, regID=%d",
 		streamID, sessionID, posLimitCounterID, channelStatusIndicatorID, logFileName, regID, origRegID)
 
@@ -922,6 +947,9 @@ func (cc *ClientConductor) OnNewPublication(streamID int32, sessionID int32, pos
 	defer cc.adminLock.Unlock()
 
 	for _, pubDef := range cc.pubs {
+		if pubDef == nil {
+			continue
+		}
 		if pubDef.regID == regID {
 			buffers := logbuffer.Wrap(logFileName)
 			if buffers == nil {
@@ -952,6 +980,26 @@ func (cc *ClientConductor) OnNewPublication(streamID int32, sessionID int32, pos
 func (cc *ClientConductor) OnNewExclusivePublication(streamID int32, sessionID int32, posLimitCounterID int32,
 	channelStatusIndicatorID int32, logFileName string, regID int64, origRegID int64) {
 
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Infof("OnNewExclusivePublication: recovered from panic (regID=%d, logFile=%s): %v", regID, logFileName, r)
+			locked := cc.adminLock.TryLock()
+			for _, pubDef := range cc.pubs {
+				if pubDef == nil {
+					continue
+				}
+				if pubDef.regID == regID {
+					pubDef.status = RegistrationStatus.ErroredMediaDriver
+					pubDef.errorCode = 0
+					pubDef.errorMessage = fmt.Sprintf("OnNewExclusivePublication panic: %v", r)
+				}
+			}
+			if locked {
+				cc.adminLock.Unlock()
+			}
+		}
+	}()
+
 	logger.Debugf("OnNewExclusivePublication: streamId=%d, sessionId=%d, posLimitCounterID=%d, channelStatusIndicatorID=%d, logFileName=%s, correlationID=%d, regID=%d",
 		streamID, sessionID, posLimitCounterID, channelStatusIndicatorID, logFileName, regID, origRegID)
 
@@ -959,6 +1007,9 @@ func (cc *ClientConductor) OnNewExclusivePublication(streamID int32, sessionID i
 	defer cc.adminLock.Unlock()
 
 	for _, pubDef := range cc.pubs {
+		if pubDef == nil {
+			continue
+		}
 		if pubDef.regID == regID {
 			buffers := logbuffer.Wrap(logFileName)
 			if buffers == nil {
