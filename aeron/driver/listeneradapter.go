@@ -224,8 +224,11 @@ func (adapter *ListenerAdapter) ReceiveMessages() int {
 
 			adapter.listener.OnClientTimeout(msg.clientID.Get())
 		default:
-			// Note: Java silently ignores unhandled events
-			logger.Fatalf("received unhandled %d", msgTypeID)
+			// Note: Java silently ignores unhandled events. We used to
+			// logger.Fatalf on unknown types which crashed the process
+			// whenever the Archive driver broadcasted a message the Go
+			// client did not implement. Log at warn level and keep going.
+			logger.Warningf("received unhandled %d (ignored)", msgTypeID)
 		}
 	}
 
