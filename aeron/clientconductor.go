@@ -1255,13 +1255,21 @@ func (cc *ClientConductor) onHeartbeatCheckTimeouts() (int, error) {
 	}
 	if now > (cc.timeOfLastKeepalive + keepaliveIntervalNs) {
 		driverTimeoutNs := cc.effectiveDriverTimeoutNs(now)
-		age := cc.driverProxy.TimeOfLastDriverKeepalive()*time.Millisecond.Nanoseconds() + driverTimeoutNs
-		if now > age {
-			cc.driverActive.Set(false)
-			return 0, fmt.Errorf("MediaDriver keepalive (ms): age=%d > timeout=%d",
-				age,
-				driverTimeoutNs/time.Millisecond.Nanoseconds(),
-			)
+		lastKeepaliveMs := cc.driverProxy.TimeOfLastDriverKeepalive()
+		// During startup, the driver may not have produced its first
+		// keepalive yet — especially for ArchivingMediaDriver which has
+		// extra initialization. Treat a non-positive value as "driver
+		// warming up, no check" and rely on the grace period + retry
+		// mechanisms to surface genuine driver-dead scenarios.
+		if lastKeepaliveMs > 0 {
+			age := lastKeepaliveMs*time.Millisecond.Nanoseconds() + driverTimeoutNs
+			if now > age {
+				cc.driverActive.Set(false)
+				return 0, fmt.Errorf("MediaDriver keepalive (ms): age=%d > timeout=%d",
+					age,
+					driverTimeoutNs/time.Millisecond.Nanoseconds(),
+				)
+			}
 		}
 
 		if cc.heartbeatTimestamp != nil {
