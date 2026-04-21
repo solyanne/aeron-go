@@ -92,6 +92,29 @@ func (buf *Buffer) Wrap(buffer unsafe.Pointer, length int32) *Buffer {
 	return buf
 }
 
+// WrapBytes points this Buffer at the given byte slice without any heap
+// allocation. Intended for zero-alloc hot paths where the caller keeps
+// the Buffer as a stack local:
+//
+//	var buf atomic.Buffer
+//	buf.WrapBytes(data)
+//	pub.Offer(&buf, 0, int32(len(data)), nil)
+//
+// Escape analysis keeps &buf on the stack when Offer (and the chain
+// below it) does not retain the pointer past the call — which is the
+// case for the normal publish path.
+//
+//go:norace
+func (buf *Buffer) WrapBytes(data []byte) *Buffer {
+	if len(data) > 0 {
+		buf.bufferPtr = unsafe.Pointer(&data[0])
+	} else {
+		buf.bufferPtr = nil
+	}
+	buf.length = int32(len(data))
+	return buf
+}
+
 // Ptr will return the raw memory pointer for the underlying buffer
 //go:norace
 func (buf *Buffer) Ptr() unsafe.Pointer {
